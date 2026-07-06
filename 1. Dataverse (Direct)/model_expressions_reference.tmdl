@@ -1,0 +1,679 @@
+/// Fabric Lakehouse/Warehouse SQL connection string (the SQL analytics endpoint).
+/// Find it in Fabric: open the Lakehouse → Settings → SQL analytics endpoint → Connection string,
+/// e.g. xxxxxxxxxxxx.datawarehouse.fabric.microsoft.com
+expression 'Fabric SQL Endpoint' = ""
+	lineageTag: 1a2b3c4d-fab1-4001-8001-000000000001
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Text
+
+/// Name of the Lakehouse (or Warehouse) that holds the Delta tables written by the four Fabric notebooks.
+expression 'Lakehouse Name' = ""
+	lineageTag: 1a2b3c4d-fab1-4002-8002-000000000002
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Text
+
+/// Helper: read a Delta table from the Fabric Lakehouse SQL endpoint by name (dbo schema).
+/// Every CT/audit/licensed/org table sources through this so only the two parameters above need setting.
+expression FabricTable =
+		(tableName as text) as table =>
+			let
+				Db = Sql.Database(#"Fabric SQL Endpoint", #"Lakehouse Name"),
+				Data = Table.SelectRows(Db, each [Schema] = "dbo" and Text.Lower([Item]) = Text.Lower(tableName)){0}[Data]
+			in
+				Data
+	lineageTag: 1a2b3c4d-fab1-4003-8003-000000000003
+
+	annotation PBI_ResultType = Function
+
+/// Helper: build an empty table with the given column names. Graceful fallback for OPTIONAL
+/// sources so a missing Lakehouse table never breaks the dashboard refresh.
+expression EmptyTable = (columns as list) as table => #table(columns, {})
+	lineageTag: 1a2b3c4d-fab1-4004-8004-000000000004
+
+	annotation PBI_ResultType = Function
+
+/// Toggle (optional): load the Dataverse agent tables. False => they load empty.
+expression Enable_Dataverse = "Include"
+	lineageTag: 1a2b3c4d-fab1-4005-8005-000000000005
+
+	annotation PBI_ResultType = Text
+
+/// Toggle (optional): load the Product Feedback (OCV) table user_feedback.
+expression Enable_ProductFeedback = "Exclude"
+	lineageTag: 1a2b3c4d-fab1-4006-8006-000000000006
+
+	annotation PBI_ResultType = Text
+
+/// SOURCE MODE— where the agent/transcript tables come from.
+/// "Fabric"        => read the pre-parsed Delta tables from the Lakehouse (original behaviour).
+/// "Dataverse"     => pull conversationtranscripts straight from Dataverse and parse in Power Query.
+/// "TranscriptCSV" => parse a local conversationtranscripts.csv (same JSON content schema as Dataverse) —
+/// used to validate the parser offline / on exported data. Credit + Agents 365 stay CSV.
+expression 'Source Mode' = "Dataverse"
+	lineageTag: 1a2b3c4d-dv01-4101-8101-000000000101
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Text
+
+/// Dataverse environment URL (e.g. https://yourorg.crm.dynamics.com). Used when Source Mode = "Dataverse".
+/// Find it in Power Platform Admin Center → Environments → <your env> → Environment URL.
+/// MULTI-ENVIRONMENT: enter more than one URL separated by a semicolon (or new line) to pull and
+/// combine transcripts from several environments into one report, e.g.
+///   https://org-a.crm.dynamics.com; https://org-b.crm.dynamics.com
+/// Each row is tagged with its source `environment`. A single URL still works unchanged.
+expression 'Dataverse Url' = "" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+	lineageTag: 1a2b3c4d-dv01-4102-8102-000000000102
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Text
+
+/// Helper: read a Dataverse entity (EntitySetName, e.g. "conversationtranscripts") via the Web API
+/// using OData.Feed against {Dataverse Url}/api/data/v9.2/. This is the same Web-API path the parser
+/// notebook uses, so it exposes the large JSON `content` field in full (the TDS/SQL endpoint truncates
+/// it). Uses the refresher's own Organizational-account login — no app secret in the template.
+/// Pass an optional OData query string (e.g. "?$select=...&$top=50") to limit columns/rows.
+/// MULTI-ENVIRONMENT: `Dataverse Url` may hold one URL or many (semicolon / new-line separated). This
+/// fans the same query out across every environment, tags each row with its source `environment`, and
+/// unions the results into one table. A failed or empty environment is skipped (try…otherwise) so one
+/// bad env never fails the whole refresh. With a single URL the behaviour is unchanged (plus the tag).
+expression DataverseEntity =
+		(entitySetName as text, optional query as text) as table =>
+			let
+				// Split the parameter into a clean list of environment base URLs.
+				RawList = Text.Split(Text.Replace(Text.Replace(#"Dataverse Url", "#(cr)", ";"), "#(lf)", ";"), ";"),
+				Urls = List.Select(List.Transform(RawList, each Text.Trim(_)), each _ <> ""),
+				// Fetch one environment and tag every row with the environment it came from.
+				FetchOne = (baseUrl as text) as table =>
+					let
+						Base = Text.TrimEnd(baseUrl, "/") & "/api/data/v9.2/",
+						Url = Base & entitySetName & (if query = null then "" else query),
+						Feed = OData.Feed(Url, null, [Implementation = "2.0", ODataVersion = 4]),
+						Tagged = Table.AddColumn(Feed, "environment", each baseUrl, type text)
+					in
+						Tagged,
+				// Pull each env independently; drop any that error or are unreachable.
+				PerEnv = List.Transform(Urls, each try FetchOne(_) otherwise null),
+				Kept = List.RemoveNulls(PerEnv),
+				Combined = if List.Count(Kept) = 0 then #table({"environment"}, {}) else Table.Combine(Kept)
+			in
+				Combined
+	lineageTag: 1a2b3c4d-dv01-4103-8103-000000000103
+
+	annotation PBI_ResultType = Function
+
+/// Path to a conversationtranscripts.csv (columns: conversationtranscriptid, content, conversationstarttime,
+/// name). Used when Source Mode = "TranscriptCSV". The `content` column holds the per-conversation JSON.
+expression 'Transcript CSV Path' = ""
+	lineageTag: 1a2b3c4d-dv01-4104-8104-000000000104
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Text
+
+/// Org/people CSV — full file path to copilot_org_data.csv (REQUIRED). Accepts a SharePoint file URL
+/// (https://contoso.sharepoint.com/sites/AICopilot/Shared Documents/copilot_org_data.csv) or a local /
+/// synced / UNC path. SharePoint URLs refresh cloud-to-cloud (OAuth2, no gateway); local/UNC need a
+/// gateway. Drives the org filter on every page. Populate it however you like (manual Entra export, or
+/// the Entra-Graph-API → SharePoint landing flow) — the model just reads the resulting file.
+expression 'Org Data CSV' = "" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+	lineageTag: 1a2b3c4d-dv01-4115-8115-000000000115
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Text
+
+/// Agents 365 CSV — full file path to agents_365.csv (OPTIONAL). Same SharePoint-URL-or-local rules as
+/// Org Data CSV. LEAVE BLANK to skip the Agents 365 table entirely (it loads empty). Source: M365 Admin
+/// → Agents → Export.
+expression 'Agent 365 CSV' = "" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=false]
+	lineageTag: 1a2b3c4d-dv01-4116-8116-000000000116
+
+	annotation PBI_NavigationStepName = Navigation
+
+	annotation PBI_ResultType = Text
+
+/// Helper: read a single CSV from a FULL file path (not a folder). If the path starts with "https://" it
+/// is read with Web.Contents (SharePoint file URL, refreshes cloud-to-cloud via OAuth2, no gateway);
+/// otherwise File.Contents (local / synced / UNC, needs an on-premises gateway). Headers promoted as-is.
+/// Errors if the file is missing, so callers can `try CsvFromPath(...) otherwise EmptyTable(...)`.
+expression CsvFromPath =
+		(path as text) as table =>
+			let
+				IsSharePoint = Text.StartsWith(Text.Lower(path), "https://"),
+				Bin = if IsSharePoint then Web.Contents(path) else File.Contents(path),
+				Doc = Csv.Document(Bin, [Delimiter = ",", Encoding = 65001, QuoteStyle = QuoteStyle.Csv]),
+				Prom = Table.PromoteHeaders(Doc, [PromoteAllScalars = true])
+			in
+				Prom
+	lineageTag: 1a2b3c4d-dv01-4114-8114-000000000114
+
+	annotation PBI_ResultType = Function
+
+/// Helper: turn a raw Dataverse agent schemaname into a friendly display name.
+/// Preference: orchestrator/header agents cluster to ONE "M365 Copilot Orchestrator" label ->
+/// the real bot display name (bot_name_hint, when it isn't just the schema) -> Employee Self-Service
+/// <role> pattern -> humanised token (publisher prefix like crb93_/cr23c_/msdyn_ stripped, words
+/// title-cased, common acronyms preserved). Keeps the Agent Evaluation page readable instead of
+/// showing tokens like "Crb93 Askbtpentest" or many "Copilots Header xxxxx" rows.
+expression CleanAgentName =
+		(schema as nullable text, optional botName as nullable text) as text =>
+			let
+				Acronyms = {"BT", "HR", "IT", "AI", "HQ", "QA", "CRM", "ERP", "M365", "API", "KPI", "PDF", "SLA", "VPN"},
+				s = if schema = null then "" else Text.From(schema),
+				lc = Text.Lower(s),
+				isOrch = Text.Contains(lc, "header") or Text.Contains(lc, "orchestrator"),
+				nameOk = botName <> null and Text.Trim(Text.From(botName)) <> "" and Text.Lower(Text.Trim(Text.From(botName))) <> lc,
+				ssPos = Text.PositionOf(lc, "copilotforemployeeselfservice"),
+				ssRole = if ssPos >= 0 then Text.Range(lc, ssPos + Text.Length("copilotforemployeeselfservice")) else "",
+				ssRoleClean = Text.Select(ssRole, {"a" .. "z"}),
+				ssLabel = if ssRoleClean = "" then "Employee Self-Service"
+						  else "Employee Self-Service " & (if List.Contains(Acronyms, Text.Upper(ssRoleClean)) then Text.Upper(ssRoleClean) else Text.Proper(ssRoleClean)),
+				// strip the publisher prefix: drop everything up to and including the FIRST underscore
+				afterFirst = if Text.Contains(s, "_") then Text.AfterDelimiter(s, "_") else s,
+				spaced = Text.Replace(Text.Replace(afterFirst, "_", " "), "-", " "),
+				words = List.Select(Text.Split(spaced, " "), each _ <> ""),
+				titled = Text.Combine(List.Transform(words, each if List.Contains(Acronyms, Text.Upper(_)) then Text.Upper(_) else Text.Proper(_)), " ")
+			in
+				if isOrch then "M365 Copilot Orchestrator"
+				else if nameOk then Text.Trim(Text.From(botName))
+				else if ssPos >= 0 then ssLabel
+				else if titled = "" then "Unknown agent"
+				else titled
+	lineageTag: 1a2b3c4d-dv01-4105-8105-000000000199
+
+	annotation PBI_ResultType = Function
+
+/// Helper: the RAW conversation transcripts, returned identically whichever source mode is active —
+/// columns conversationtranscriptid | content | conversationstarttime | name | agent_schema_hint | bot_name_hint.
+/// The parser consumes this, so logic is source-agnostic. agent_schema_hint (the schemaname token) and
+/// bot_name_hint (the human-authored bot display name) both come from the Dataverse bot lookup
+/// ($expand bot_conversationtranscriptid($select=schemaname,name)) so single-agent transcripts (whose
+/// JSON content carries no botSchemaName) still resolve a primary agent AND a friendly name; both are
+/// null in CSV mode. bot_name_hint is what CleanAgentName prefers so agents show their real display name.
+expression RawTranscripts =
+		() as table =>
+			let
+				Cols = {"conversationtranscriptid", "content", "conversationstarttime", "name", "environment"},
+				Empty = Table.AddColumn(Table.AddColumn(#table(Cols, {}), "agent_schema_hint", each null, type text), "bot_name_hint", each null, type text),
+				Output =
+					if #"Source Mode" = "Dataverse" then
+						let
+							// Try WITH the bot-schema expand; some environments don't expose the
+							// bot_conversationtranscriptid navigation property, so fall back to a plain
+							// select (agent_schema_hint = null; the parser then derives the agent from
+							// the JSON content). Keeps the Dataverse path robust across environments.
+							SrcExpanded = try DataverseEntity("conversationtranscripts", "?$select=conversationtranscriptid,content,conversationstarttime,name&$expand=bot_conversationtranscriptid($select=schemaname,name)"),
+							SrcPlain    = DataverseEntity("conversationtranscripts", "?$select=conversationtranscriptid,content,conversationstarttime,name"),
+							HasExpand   = SrcExpanded[HasError] = false and List.Contains(Table.ColumnNames(SrcExpanded[Value]), "bot_conversationtranscriptid"),
+							Src         = if SrcExpanded[HasError] = false then SrcExpanded[Value] else SrcPlain,
+							Have = List.Intersect({Cols, Table.ColumnNames(Src)}),
+							// Flatten the bot lookup record to a schemaname token hint when present.
+							WithHint = Table.AddColumn(Src, "agent_schema_hint", each
+									if not HasExpand then null else
+									let b = try [bot_conversationtranscriptid] otherwise null
+									in if b = null then null else (try Text.From(Record.FieldOrDefault(b, "schemaname", null)) otherwise null), type text),
+							// Flatten the bot lookup record to the friendly bot display name when present.
+							WithBotName = Table.AddColumn(WithHint, "bot_name_hint", each
+									if not HasExpand then null else
+									let b = try [bot_conversationtranscriptid] otherwise null
+									in if b = null then null else (try Text.From(Record.FieldOrDefault(b, "name", null)) otherwise null), type text),
+							Keep = Table.SelectColumns(WithBotName, List.Combine({Have, {"agent_schema_hint", "bot_name_hint"}}), MissingField.UseNull)
+						in
+							Keep
+					else if #"Source Mode" = "TranscriptCSV" then
+						let
+							Csv = Csv.Document(File.Contents(#"Transcript CSV Path"), [Delimiter = ",", Encoding = 65001, QuoteStyle = QuoteStyle.Csv]),
+							Prom = Table.PromoteHeaders(Csv, [PromoteAllScalars = true]),
+							Have = List.Intersect({Cols, Table.ColumnNames(Prom)}),
+							Sel = Table.SelectColumns(Prom, Have, MissingField.UseNull),
+							WithHint = Table.AddColumn(Sel, "agent_schema_hint", each (if List.Contains(Table.ColumnNames(Prom), "agent_schema_hint") then Record.FieldOrDefault(_, "agent_schema_hint", null) else null), type text),
+							WithBotName = Table.AddColumn(WithHint, "bot_name_hint", each (if List.Contains(Table.ColumnNames(Prom), "bot_name_hint") then Record.FieldOrDefault(_, "bot_name_hint", null) else null), type text)
+						in
+							WithBotName
+					else
+						Empty
+			in
+				Output
+	lineageTag: 1a2b3c4d-dv01-4105-8105-000000000105
+
+	annotation PBI_ResultType = Function
+
+/// Parser base: RAW transcripts with the JSON `content` parsed once into an `acts` activities list
+/// (one row per conversation that parsed). Sessions/Turns/Errors/Sub-agents all build from this, so the
+/// JSON is parsed a single time per consuming query. Mirrors notebook cell 2b (parse JSON content).
+expression ParsedBase =
+		() as table =>
+			let
+				Raw = RawTranscripts(),
+				WithJson = Table.AddColumn(Raw, "j", each try Json.Document([content]) otherwise null),
+				Valid = Table.SelectRows(WithJson, each [j] <> null),
+				WithActs = Table.AddColumn(Valid, "acts", each
+						let jj = [j]
+						in
+							if jj is list then jj
+							else if jj is record then
+								(if Record.HasFields(jj, "activities") and Record.Field(jj, "activities") is list then Record.Field(jj, "activities")
+								 else if Record.HasFields(jj, "Activities") and Record.Field(jj, "Activities") is list then Record.Field(jj, "Activities")
+								 else {})
+							else {})
+			in
+				WithActs
+	lineageTag: 1a2b3c4d-dv01-4106-8106-000000000106
+
+	annotation PBI_ResultType = Function
+
+/// Parse one row per CONVERSATION from the transcript activities — the M port of the notebook's
+/// build_sessions(). Output columns match the agent_sessions Delta contract the model consumes.
+/// LLM-derived primary_topic_derived is set null (the generic DAX Topic classifier handles topics);
+/// is_returning_user is computed across the batch (user appears in >1 conversation).
+expression Parse_Sessions =
+		() as table =>
+			let
+				Base = ParsedBase(),
+				fld = (r, n, d) => if r is record and Record.HasFields(r, n) then Record.Field(r, n) else d,
+				roleOf = (a) =>
+						let rl = fld(fld(a, "from", [role = null]), "role", null)
+						in if rl = 0 or rl = "user" then "user" else if rl = 1 or rl = "bot" then "bot" else "other",
+				verdictOf = (v) =>
+						if v = null then null
+						else if v is logical then (if v then "Positive" else "Negative")
+						else if v is number then (if v > 0 then "Positive" else "Negative")
+						else let s = Text.Lower(Text.From(v)) in
+							if List.Contains({"true","1","like","thumbsup","thumbs up","up","positive","helpful","yes","good","smile"}, s) then "Positive"
+							else if List.Contains({"false","0","dislike","thumbsdown","thumbs down","down","negative","unhelpful","no","bad","frown"}, s) then "Negative"
+							else null,
+				execMs = (t) =>
+						let
+							s = Text.From(t),
+							parts = Text.Split(s, ":")
+						in
+							if List.Count(parts) = 3 then
+								(try (Number.From(parts{0})*3600 + Number.From(parts{1})*60 + Number.From(parts{2})) * 1000 otherwise 0)
+							else 0,
+				Rec = Table.AddColumn(Base, "S", each
+						let
+							acts = [acts],
+							msgs = List.Select(acts, each (try [type] otherwise "") = "message"),
+							userMsgs = List.Select(msgs, each roleOf(_) = "user"),
+							botMsgs = List.Select(msgs, each roleOf(_) = "bot"),
+							firstUser = if List.Count(userMsgs) > 0 then userMsgs{0} else null,
+							userIdRaw = if firstUser = null then null else
+									let fr = fld(firstUser, "from", null)
+									in if fr = null then null else (let a = fld(fr, "aadObjectId", null) in if a <> null then a else fld(fr, "id", null)),
+							// agent identity
+							connected = List.Distinct(List.RemoveNulls(List.Transform(acts, each
+									if fld(_, "valueType", "") = "ConnectedAgentInitializeTraceData" then
+										let v = fld(_, "value", null) in if v = null then null else (let sn = fld(v, "connectedAgentBotSchemaName", null) in if sn <> null then sn else fld(v, "botSchemaName", null))
+									else null))),
+							primaryAgent = List.First(List.RemoveNulls(List.Transform(acts, each
+									let v = fld(_, "value", null) in
+									if fld(_, "valueType", "") = "ConnectedAgentInitializeTraceData" and v <> null then fld(v, "parentBotSchemaName", null)
+									else if v <> null then (let b = fld(v, "botSchemaName", null) in if b <> null then b else fld(v, "parentBotSchemaName", null))
+									else null)), null),
+							// cost / latency / plan steps
+							planActs = List.Select(acts, each (let v = fld(_, "value", null) in v <> null and v is record and Record.HasFields(v, "displayedCost"))),
+							cost = List.Sum(List.Transform(planActs, each try Number.From(fld(fld(_, "value", []), "displayedCost", 0)) otherwise 0)),
+							planSteps = List.Count(planActs),
+							latency = List.Sum(List.Transform(planActs, each execMs(fld(fld(_, "value", []), "executionTime", null)))),
+							// knowledge
+							ktrace = List.Select(acts, each fld(_, "valueType", "") = "KnowledgeTraceData"),
+							kSearched = List.AnyTrue(List.Transform(ktrace, each fld(fld(_, "value", []), "isKnowledgeSearched", false) = true)),
+							kAnswered = List.AnyTrue(List.Transform(ktrace, each fld(fld(_, "value", []), "completionState", "") = "Answered")),
+							kSources = List.Sum(List.Transform(ktrace, each List.Count(fld(fld(_, "value", []), "citedKnowledgeSources", {})))),
+							// grounding
+							gInternal = List.AnyTrue(List.Transform(acts, each
+									let vt = fld(_, "valueType", ""), nm = Text.From(fld(_, "name", "")), gv = fld(_, "value", []) in
+									(vt = "KnowledgeTraceData" and fld(gv, "isKnowledgeSearched", false) = true)
+									or (Text.Contains(nm, "UniversalSearch") and fld(gv, "knowledgeSources", null) <> null))),
+							gExternal = List.AnyTrue(List.Transform(acts, each
+									let nm = Text.Lower(Text.From(fld(_, "name", ""))) in
+									(Text.Contains(nm, "web") and Text.Contains(nm, "search")))),
+							grounding = if gInternal and gExternal then "Mixed (Internal+Web)" else if gExternal then "External (Web)" else if gInternal then "Internal" else "Ungrounded",
+							// errors
+							errs = List.Transform(List.Select(acts, each fld(_, "valueType", "") = "ErrorTraceData"), each fld(fld(_, "value", []), "errorCode", "Unknown")),
+							// feedback
+							fbOffered = List.Count(List.Select(acts, each (let cd = fld(_, "channelData", null) in cd <> null and cd is record and Record.HasFields(cd, "feedbackLoop")))),
+							verdict = List.First(List.RemoveNulls(List.Transform(acts, each
+									let cd = fld(_, "channelData", []), fl = fld(cd, "feedbackLoop", []) in
+									if fl is record then verdictOf(let a = fld(fl, "value", null) in if a <> null then a else (let b = fld(fl, "reaction", null) in if b <> null then b else fld(fl, "vote", null))) else null)), null),
+							comment = List.First(List.RemoveNulls(List.Transform(acts, each
+									let cd = fld(_, "channelData", []), fl = fld(cd, "feedbackLoop", []) in
+									if fl is record then (let t = fld(fl, "feedbackText", null) in if t <> null then t else fld(fl, "text", null)) else null)), null),
+							// timing
+							tsList = List.RemoveNulls(List.Transform(acts, each fld(_, "timestampMs", null))),
+							firstTs = if List.Count(tsList) > 0 then List.Min(tsList) else null,
+							lastTs = if List.Count(tsList) > 0 then List.Max(tsList) else null,
+							durMs = if firstTs <> null and lastTs <> null then lastTs - firstTs else null,
+							startUtc = if firstTs <> null then #datetime(1970,1,1,0,0,0) + #duration(0,0,0,firstTs/1000) else (try DateTime.From([conversationstarttime]) otherwise null),
+							firstPrompt = if List.Count(userMsgs) > 0 then Text.Start(Text.From(fld(userMsgs{0}, "text", "")), 500) else ""
+						in
+							[
+								conversation_id = [conversationtranscriptid],
+								session_start_utc = startUtc,
+								session_duration_ms = durMs,
+								user_id_hash = if userIdRaw = null or userIdRaw = "" then null else Text.From(userIdRaw),
+								primary_agent_schema = (let h = try [agent_schema_hint] otherwise null in if h <> null and h <> "" then h else primaryAgent),
+								connected_agent_schemas = if List.Count(connected) > 0 then Text.Combine(List.Transform(connected, Text.From), "|") else null,
+								connected_agent_count = List.Count(connected),
+								msg_count = List.Count(msgs),
+								user_msg_count = List.Count(userMsgs),
+								bot_msg_count = List.Count(botMsgs),
+								plan_step_count = planSteps,
+								total_displayed_cost = cost,
+								total_latency_ms = latency,
+								knowledge_searched = kSearched,
+								knowledge_answered = kAnswered,
+								knowledge_sources_count = kSources,
+								error_count = List.Count(errs),
+								first_error_code = if List.Count(errs) > 0 then errs{0} else null,
+								feedback_offered_count = fbOffered,
+								feedback_submitted = if verdict <> null then 1 else 0,
+								feedback_verdict = verdict,
+								feedback_comment = comment,
+								first_user_prompt = firstPrompt,
+								grounding_source = grounding,
+								session_outcome_explicit = null,
+								session_outcome_reason_explicit = null,
+								is_authenticated = (userIdRaw <> null and userIdRaw <> ""),
+								is_returning_user = null,
+								primary_topic_derived = null
+							]),
+				Cols = {"conversation_id","session_start_utc","session_duration_ms","user_id_hash","primary_agent_schema","connected_agent_schemas","connected_agent_count","msg_count","user_msg_count","bot_msg_count","plan_step_count","total_displayed_cost","total_latency_ms","knowledge_searched","knowledge_answered","knowledge_sources_count","error_count","first_error_code","feedback_offered_count","feedback_submitted","feedback_verdict","feedback_comment","first_user_prompt","grounding_source","session_outcome_explicit","session_outcome_reason_explicit","is_authenticated","is_returning_user","primary_topic_derived"},
+				Expanded = Table.ExpandRecordColumn(Rec, "S", Cols),
+				Out = Table.SelectColumns(Expanded, Cols),
+				// is_returning_user: user appears in more than one conversation
+				Counts = Table.Group(Table.SelectRows(Out, each [user_id_hash] <> null), {"user_id_hash"}, {{"n", each Table.RowCount(_), Int64.Type}}),
+				ReturnSet = List.Buffer(Table.SelectRows(Counts, each [n] > 1)[user_id_hash]),
+				WithReturn = Table.ReplaceValue(Out, each [is_returning_user], each (if [user_id_hash] <> null and List.Contains(ReturnSet, [user_id_hash]) then true else false), Replacer.ReplaceValue, {"is_returning_user"})
+			in
+				WithReturn
+	lineageTag: 1a2b3c4d-dv01-4107-8107-000000000107
+
+	annotation PBI_ResultType = Function
+
+/// M port of build_turns(): one row per message activity, with per-turn intent + knowledge (keyed by
+/// replyToId -> message id) and per-turn submitted feedback. Output matches agent_turns Delta contract.
+expression Parse_Turns =
+		() as table =>
+			let
+				Base = ParsedBase(),
+				fld = (r, n, d) => if r is record and Record.HasFields(r, n) then Record.Field(r, n) else d,
+				roleOf = (a) =>
+						let rl = fld(fld(a, "from", [role = null]), "role", null)
+						in if rl = 0 or rl = "user" then "user" else if rl = 1 or rl = "bot" then "bot" else "other",
+				verdictOf = (v) =>
+						if v = null then null
+						else if v is logical then (if v then "Positive" else "Negative")
+						else if v is number then (if v > 0 then "Positive" else "Negative")
+						else let s = Text.Lower(Text.From(v)) in
+							if List.Contains({"true","1","like","thumbsup","thumbs up","up","positive","helpful","yes","good","smile"}, s) then "Positive"
+							else if List.Contains({"false","0","dislike","thumbsdown","thumbs down","down","negative","unhelpful","no","bad","frown"}, s) then "Negative"
+							else null,
+				isoOf = (ms) => if ms = null then null else #datetime(1970,1,1,0,0,0) + #duration(0,0,0,ms/1000),
+				PerConv = Table.AddColumn(Base, "T", each
+						let
+							acts = [acts],
+							convId = [conversationtranscriptid],
+							// intent + knowledge maps keyed by replyToId
+							intents = List.Select(acts, each fld(_, "valueType", "") = "IntentRecognition"),
+							knows = List.Select(acts, each fld(_, "valueType", "") = "KnowledgeTraceData"),
+							lookupIntent = (mid) =>
+									let hit = List.First(List.Select(intents, each fld(_, "replyToId", null) = mid), null)
+									in if hit = null then [it = null, ii = null, isc = null] else let v = fld(hit, "value", []) in [it = fld(v, "intentTitle", null), ii = fld(v, "intentId", null), isc = fld(fld(v, "intentScore", []), "score", null)],
+							lookupKnow = (mid) =>
+									let hit = List.First(List.Select(knows, each fld(_, "replyToId", null) = mid), null)
+									in if hit = null then [ks = null, ka = null, src = null] else let v = fld(hit, "value", []) in [ks = (fld(v, "isKnowledgeSearched", false) = true), ka = (fld(v, "completionState", "") = "Answered"), src = Text.Combine(List.Transform(fld(v, "citedKnowledgeSources", {}), Text.From), "|")],
+							msgs = List.Select(acts, each (try [type] otherwise "") = "message"),
+							rows = List.Transform(msgs, each
+									let
+										a = _,
+										role = roleOf(a),
+										mid = fld(a, "id", null),
+										it = lookupIntent(mid),
+										kn = lookupKnow(mid),
+										cd = fld(a, "channelData", []),
+										fbOffered = (cd is record and Record.HasFields(cd, "feedbackLoop")),
+										fl = fld(cd, "feedbackLoop", []),
+										verdict = if fl is record then verdictOf(let x = fld(fl, "value", null) in if x <> null then x else (let y = fld(fl, "reaction", null) in if y <> null then y else fld(fl, "vote", null))) else null,
+										comment = if fl is record then (let t = fld(fl, "feedbackText", null) in if t <> null then t else fld(fl, "text", null)) else null,
+										fr = fld(a, "from", null),
+										fromId = if fr = null then null else (let x = fld(fr, "aadObjectId", null) in if x <> null then x else fld(fr, "id", null))
+									in
+										[
+											conversation_id = convId,
+											turn_id = mid,
+											turn_timestamp_utc = isoOf(fld(a, "timestampMs", null)),
+											turn_role = role,
+											turn_channel = fld(a, "channelId", null),
+											from_user_hash = if role = "user" and fromId <> null then Text.From(fromId) else null,
+											text_preview_500 = Text.Start(Text.From(fld(a, "text", "")), 500),
+											text_length = Text.Length(Text.From(fld(a, "text", ""))),
+											intent_title = it[it],
+											intent_id = it[ii],
+											intent_score = it[isc],
+											knowledge_searched = kn[ks],
+											knowledge_answered = kn[ka],
+											knowledge_sources = kn[src],
+											feedback_offered = fbOffered,
+											feedback_verdict = verdict,
+											feedback_comment = comment
+										])
+						in
+							rows),
+				Cols = {"conversation_id","turn_id","turn_timestamp_utc","turn_role","turn_channel","from_user_hash","text_preview_500","text_length","intent_title","intent_id","intent_score","knowledge_searched","knowledge_answered","knowledge_sources","feedback_offered","feedback_verdict","feedback_comment"},
+				Listed = Table.SelectColumns(PerConv, {"T"}),
+				Expanded = Table.ExpandListColumn(Listed, "T"),
+				Filtered = Table.SelectRows(Expanded, each [T] <> null),
+				RecCol = Table.ExpandRecordColumn(Filtered, "T", Cols),
+				Out = Table.SelectColumns(RecCol, Cols)
+			in
+				Out
+	lineageTag: 1a2b3c4d-dv01-4108-8108-000000000108
+
+	annotation PBI_ResultType = Function
+
+/// M port of build_errors(): one row per ErrorTraceData activity. Matches agent_errors Delta contract.
+expression Parse_Errors =
+		() as table =>
+			let
+				Base = ParsedBase(),
+				fld = (r, n, d) => if r is record and Record.HasFields(r, n) then Record.Field(r, n) else d,
+				isoOf = (ms) => if ms = null then null else #datetime(1970,1,1,0,0,0) + #duration(0,0,0,ms/1000),
+				PerConv = Table.AddColumn(Base, "E", each
+						let
+							convId = [conversationtranscriptid],
+							errActs = List.Select([acts], each fld(_, "valueType", "") = "ErrorTraceData")
+						in
+							List.Transform(errActs, each
+								let v = fld(_, "value", []) in
+								[
+									conversation_id = convId,
+									error_timestamp_utc = isoOf(fld(_, "timestampMs", null)),
+									error_code = fld(v, "errorCode", null),
+									error_sub_code = fld(v, "errorSubCode", null),
+									error_message = Text.Start(Text.From(fld(v, "errorMessage", "")), 500),
+									is_user_error = (fld(v, "isUserError", false) = true)
+								])),
+				Cols = {"conversation_id","error_timestamp_utc","error_code","error_sub_code","error_message","is_user_error"},
+				Listed = Table.SelectColumns(PerConv, {"E"}),
+				Expanded = Table.ExpandListColumn(Listed, "E"),
+				Filtered = Table.SelectRows(Expanded, each [E] <> null),
+				RecCol = Table.ExpandRecordColumn(Filtered, "E", Cols),
+				Out = Table.SelectColumns(RecCol, Cols)
+			in
+				Out
+	lineageTag: 1a2b3c4d-dv01-4109-8109-000000000109
+
+	annotation PBI_ResultType = Function
+
+/// M port of build_subagents(): one row per ConnectedAgent initialize/completed trace. Matches
+/// agent_subagents Delta contract.
+expression Parse_SubAgents =
+		() as table =>
+			let
+				Base = ParsedBase(),
+				fld = (r, n, d) => if r is record and Record.HasFields(r, n) then Record.Field(r, n) else d,
+				isoOf = (ms) => if ms = null then null else #datetime(1970,1,1,0,0,0) + #duration(0,0,0,ms/1000),
+				PerConv = Table.AddColumn(Base, "G", each
+						let
+							convId = [conversationtranscriptid],
+							saActs = List.Select([acts], each List.Contains({"ConnectedAgentInitializeTraceData","ConnectedAgentCompletedTraceData"}, fld(_, "valueType", "")))
+						in
+							List.Transform(saActs, each
+								let vt = fld(_, "valueType", ""), v = fld(_, "value", []), uid = fld(v, "userId", null) in
+								[
+									conversation_id = convId,
+									invocation_timestamp_utc = isoOf(fld(_, "timestampMs", null)),
+									event_type = if Text.EndsWith(vt, "InitializeTraceData") then "initialize" else "completed",
+									parent_agent_schema = fld(v, "parentBotSchemaName", null),
+									connected_agent_schema = let x = fld(v, "connectedAgentBotSchemaName", null) in if x <> null then x else fld(v, "botSchemaName", null),
+									dialog_schema = fld(v, "dialogSchemaName", null),
+									user_id_hash = if uid = null or uid = "" then null else Text.From(uid),
+									plan_step_id = fld(v, "planStepId", null)
+								])),
+				Cols = {"conversation_id","invocation_timestamp_utc","event_type","parent_agent_schema","connected_agent_schema","dialog_schema","user_id_hash","plan_step_id"},
+				Listed = Table.SelectColumns(PerConv, {"G"}),
+				Expanded = Table.ExpandListColumn(Listed, "G"),
+				Filtered = Table.SelectRows(Expanded, each [G] <> null),
+				RecCol = Table.ExpandRecordColumn(Filtered, "G", Cols),
+				Out = Table.SelectColumns(RecCol, Cols)
+			in
+				Out
+	lineageTag: 1a2b3c4d-dv01-410a-810a-00000000010a
+
+	annotation PBI_ResultType = Function
+
+/// M port of build_agent_performance(): one row per conversation with the per-conversation KPI fact
+/// (outcome, implied success, topics, durations, ESS UPN). Matches the agent_performance Delta contract
+/// (39 source columns). Drives the Quality & Performance / Agent Evaluation pages.
+expression Parse_Performance =
+		() as table =>
+			let
+				Base = ParsedBase(),
+				fld = (r, n, d) => if r is record and Record.HasFields(r, n) then Record.Field(r, n) else d,
+				roleOf = (a) =>
+						let rl = fld(fld(a, "from", [role = null]), "role", null)
+						in if rl = 0 or rl = "user" then "user" else if rl = 1 or rl = "bot" then "bot" else "other",
+				isoOf = (ms) => if ms = null then null else #datetime(1970,1,1,0,0,0) + #duration(0,0,0,ms/1000),
+				execMs = (t) =>
+						let s = Text.From(t), parts = Text.Split(s, ":")
+						in if List.Count(parts) = 3 then (try (Number.From(parts{0})*3600 + Number.From(parts{1})*60 + Number.From(parts{2})) * 1000 otherwise 0) else 0,
+				txt = (a) => Text.Start(Text.From(fld(a, "text", "")), 500),
+				Rec = Table.AddColumn(Base, "P", each
+						let
+							acts = [acts],
+							msgs = List.Select(acts, each (try [type] otherwise "") = "message"),
+							userMsgs = List.Select(msgs, each roleOf(_) = "user"),
+							botMsgs = List.Select(msgs, each roleOf(_) = "bot"),
+							connected = List.Distinct(List.RemoveNulls(List.Transform(acts, each
+									if fld(_, "valueType", "") = "ConnectedAgentInitializeTraceData" then
+										let v = fld(_, "value", null) in if v = null then null else (let sn = fld(v, "connectedAgentBotSchemaName", null) in if sn <> null then sn else fld(v, "botSchemaName", null))
+									else null))),
+							primaryAgent = List.First(List.RemoveNulls(List.Transform(acts, each
+									let v = fld(_, "value", null) in
+									if fld(_, "valueType", "") = "ConnectedAgentInitializeTraceData" and v <> null then fld(v, "parentBotSchemaName", null)
+									else if v <> null then (let b = fld(v, "botSchemaName", null) in if b <> null then b else fld(v, "parentBotSchemaName", null))
+									else null)), null),
+							intentActs = List.Select(acts, each fld(_, "valueType", "") = "IntentRecognition"),
+							topics = List.Distinct(List.RemoveNulls(List.Transform(intentActs, each fld(fld(_, "value", []), "intentTitle", null)))),
+							lastIntentId = List.Last(List.RemoveNulls(List.Transform(intentActs, each fld(fld(_, "value", []), "intentId", null)))),
+							errActs = List.Select(acts, each fld(_, "valueType", "") = "ErrorTraceData"),
+							sysError = List.AnyTrue(List.Transform(errActs, each fld(fld(_, "value", []), "isUserError", false) <> true)),
+							userError = List.AnyTrue(List.Transform(errActs, each fld(fld(_, "value", []), "isUserError", false) = true)),
+							traceCount = List.Count(List.Select(acts, each (try [type] otherwise "") = "trace")),
+							eventCount = List.Count(List.Select(acts, each (try [type] otherwise "") = "event")),
+							planActs = List.Select(acts, each (let v = fld(_, "value", null) in v <> null and v is record and Record.HasFields(v, "executionTime"))),
+							planSteps = List.Count(planActs),
+							latencyTotal = List.Sum(List.Transform(planActs, each execMs(fld(fld(_, "value", []), "executionTime", null)))),
+							avgLatency = if planSteps > 0 then Number.RoundDown(latencyTotal / planSteps) else 0,
+							tsList = List.RemoveNulls(List.Transform(acts, each fld(_, "timestampMs", null))),
+							firstTs = if List.Count(tsList) > 0 then List.Min(tsList) else null,
+							lastTs = if List.Count(tsList) > 0 then List.Max(tsList) else null,
+							durationS = if firstTs <> null and lastTs <> null then Number.RoundDown((lastTs - firstTs) / 1000) else 0,
+							upn = List.First(List.RemoveNulls(List.Transform(acts, each
+									let v = fld(_, "value", []), vars = fld(v, "variables", []) in
+									if vars is record then (let u = fld(vars, "ESS_UserContext_UPN", null) in if u <> null then u else fld(vars, "Var_ESS_UserContext_UPN", null)) else null)), null),
+							engaged = (List.Count(topics) > 0) or (List.Count(botMsgs) > 0),
+							sessionType = if engaged then "Engaged" else "Unengaged",
+							outcome = if List.Count(connected) > 0 then "Escalated"
+									  else if (not engaged) or (List.Count(userMsgs) > 0 and List.Count(botMsgs) = 0) or (sysError and List.Count(botMsgs) = 0) then "Abandoned"
+									  else "Resolved",
+							outcomeReason = if sysError then "SystemError" else if userError then "UserError" else if outcome = "Escalated" then "Escalated" else if outcome = "Abandoned" then "Abandoned" else "Completed",
+							impliedSuccess = if outcome = "Resolved" and not sysError then "TRUE" else "FALSE",
+							startDt = if firstTs <> null then isoOf(firstTs) else (try DateTime.From([conversationstarttime]) otherwise null),
+							endDt = if lastTs <> null then isoOf(lastTs) else null
+						in
+							[
+								ConversationTranscriptId = [conversationtranscriptid],
+								ConversationStartTime = (try DateTime.From([conversationstarttime]) otherwise startDt),
+								SchemaVersion = null,
+								BotName = CleanAgentName((let h = try [agent_schema_hint] otherwise null in if h <> null and h <> "" then h else (if primaryAgent = null then "" else primaryAgent)), (try [bot_name_hint] otherwise null)),
+								BotId = null,
+								AADTenantId = null,
+								BatchId = null,
+								SessionStartTimeUtc = startDt,
+								SessionEndTimeUtc = endDt,
+								SessionType = sessionType,
+								SessionOutcome = outcome,
+								TurnCount = List.Count(msgs),
+								OutcomeReason = outcomeReason,
+								ImpliedSuccess = impliedSuccess,
+								LastUserIntentId = lastIntentId,
+								IsDesignMode = "FALSE",
+								Locale = null,
+								UserMessageCount = List.Count(userMsgs),
+								BotMessageCount = List.Count(botMsgs),
+								TotalMessageCount = List.Count(msgs),
+								FirstUserMessage = if List.Count(userMsgs) > 0 then txt(userMsgs{0}) else "",
+								LastUserMessage = if List.Count(userMsgs) > 0 then txt(List.Last(userMsgs)) else "",
+								FirstBotMessage = if List.Count(botMsgs) > 0 then txt(botMsgs{0}) else "",
+								LastBotMessage = if List.Count(botMsgs) > 0 then txt(List.Last(botMsgs)) else "",
+								TopicsTriggered = if List.Count(topics) > 0 then Text.Combine(List.Transform(topics, Text.From), "|") else "",
+								TopicCount = List.Count(topics),
+								PrimaryTopic = if List.Count(topics) > 0 then topics{0} else "",
+								DurationSeconds = durationS,
+								AverageLatencyMs = avgLatency,
+								Var_ESS_UserContext_UPN = upn,
+								Var_ESS_Message_Disclaimer = "",
+								Var_ESS_UserContext_RefreshInterval_Hours = "",
+								Var_ESS_UserContext_Conversation_Initialized = "",
+								AllVariables = "",
+								TotalActivityCount = List.Count(acts),
+								TraceActivityCount = traceCount,
+								EventActivityCount = eventCount,
+								StatusCode = if outcome = "Resolved" then 1 else 0,
+								StateCode = 1,
+								FirstErrorCode = if List.Count(errActs) > 0 then fld(fld(errActs{0}, "value", []), "errorCode", null) else null,
+								ErrorCategory = null,
+								IsAuthenticated = if List.Count(userMsgs) > 0 and (let fr = fld(userMsgs{0}, "from", []) in fld(fr, "aadObjectId", null) <> null) then "TRUE" else "FALSE",
+								MultiAgentSession = if List.Count(connected) > 0 then "TRUE" else "FALSE",
+								SessionOutcomeExplicit = null,
+								SessionOutcomeReasonExplicit = null,
+								GenerativeResponseCount = List.Count(List.Select(acts, each fld(_, "valueType", "") = "GenerativeAIResponseTraceData" or fld(_, "valueType", "") = "GenerativeResponseTraceData")),
+								LLMCallCount = null,
+								PromptTokenCount = null,
+								CompletionTokenCount = null,
+								TotalTokenCount = null,
+								PluginCallCount = null,
+								PluginSuccessCount = null,
+								TopicsStarted = List.Count(topics),
+								TopicsCompleted = null,
+								TopicCompletionRate = null,
+								PrimaryTopicDwellMs = null,
+								TotalTopicDwellMs = null
+							]),
+				Cols = {"ConversationTranscriptId","ConversationStartTime","SchemaVersion","BotName","BotId","AADTenantId","BatchId","SessionStartTimeUtc","SessionEndTimeUtc","SessionType","SessionOutcome","TurnCount","OutcomeReason","ImpliedSuccess","LastUserIntentId","IsDesignMode","Locale","UserMessageCount","BotMessageCount","TotalMessageCount","FirstUserMessage","LastUserMessage","FirstBotMessage","LastBotMessage","TopicsTriggered","TopicCount","PrimaryTopic","DurationSeconds","AverageLatencyMs","Var_ESS_UserContext_UPN","Var_ESS_Message_Disclaimer","Var_ESS_UserContext_RefreshInterval_Hours","Var_ESS_UserContext_Conversation_Initialized","AllVariables","TotalActivityCount","TraceActivityCount","EventActivityCount","StatusCode","StateCode","FirstErrorCode","ErrorCategory","IsAuthenticated","MultiAgentSession","SessionOutcomeExplicit","SessionOutcomeReasonExplicit","GenerativeResponseCount","LLMCallCount","PromptTokenCount","CompletionTokenCount","TotalTokenCount","PluginCallCount","PluginSuccessCount","TopicsStarted","TopicsCompleted","TopicCompletionRate","PrimaryTopicDwellMs","TotalTopicDwellMs"},
+				Expanded = Table.ExpandRecordColumn(Rec, "P", Cols),
+				Out = Table.SelectColumns(Expanded, Cols)
+			in
+				Out
+	lineageTag: 1a2b3c4d-dv01-410b-810b-00000000010b
+
+	annotation PBI_ResultType = Function
+

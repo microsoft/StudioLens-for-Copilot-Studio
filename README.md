@@ -67,14 +67,6 @@ scheduling. New to StudioLens? Start with **Dataverse (Direct)** for the fastest
 
 ---
 
-## Related
-
-**StudioLens is part of [CopilotScope](https://github.com/Keithland89/CopilotScope)** — a wider kit of
-Power BI "lenses" for Microsoft 365 Copilot (value, adoption, readiness, maturity, behaviour, leadership).
-StudioLens is the **Copilot Studio agent** lens, available here as a **standalone** template (incl.
-Dataverse-Direct, no Fabric) for teams who only need the agent deep-dive. Want the broader
-whole-Copilot value story too? See **[CopilotScope](https://github.com/Keithland89/CopilotScope)**.
-
 ## About
 
-StudioLens and CopilotScope are created and maintained by the **Microsoft Business Value Advisory (BVA)** team.
+StudioLens is created and maintained by the **Microsoft Business Value Advisory (BVA)** team.

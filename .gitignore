@@ -1,0 +1,27 @@
+# Customer data — never commit
+*.csv
+!sample-data/*.csv
+!docs/*.csv
+
+# Power BI workspace artefacts
+*.pbip.local
+*.pbix
+.pbi/
+.DS_Store
+Thumbs.db
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+*.abf
+
+*.parquet
+
+*.xlsx
